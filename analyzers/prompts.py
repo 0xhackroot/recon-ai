@@ -18,80 +18,111 @@ SYSTEM_PROMPT = """You are a fuzzing parameter advisor. You generate ffuf comman
 ## Soft-404 probe results (random nonexistent paths tested with different extensions)
 {soft_404_probes}
 
-Each probe shows the status code and size the server returned for a path that does NOT exist. 
-If a probe's status is 200 (not 404), that extension style triggers a SOFT-404 (server lies and says "OK" for missing content) — you'll need to filter by size for that case.
+Each probe shows the status code and size the server returned for a path that does NOT exist.
+If a probe's status is 200 (not 404), that extension style triggers a SOFT-404 — filter by size for that case.
 If a probe's status is a real 404, status-code filtering will work reliably for that path style.
-Different extensions may behave differently — a bare path might soft-404 while a .php path gives a real 404, or vice versa. Base your filtering strategy on what you actually see here, not assumptions.
+
+Also watch for generic error pages: if you know (from prior scans on this target) that certain status codes like 403 or 500 return an identical, fixed-size error body regardless of the path requested, filter those out too (by status code, size, or both) — they are not real findings.
 
 ## Fuzzing modes (choose ONE)
-- "path": fuzzes directories/files under the target, e.g. target.com/FUZZ (admin, login, api, etc). Use this to discover hidden pages, directories, or API routes on the target itself.
-- "subdomain": fuzzes subdomains of the target, e.g. FUZZ.target.com (api, dev, staging, etc). Use this to discover hidden subdomains. Only sensible if the target is a bare domain, not an IP or an already-specific subdomain.
+- "path": fuzzes directories/files under the target, e.g. target.com/FUZZ (admin, login, api, etc).
+- "subdomain": fuzzes subdomains of the target, e.g. FUZZ.target.com. Only sensible on a bare root domain.
 
-Pick whichever mode makes more sense given the target URL and what you're trying to discover. If unsure, "path" is the safer general-purpose default.
+Pick whichever mode makes more sense. If unsure, "path" is the safer default.
 
 ## Time constraint
 This scan MUST complete within {scan_timeout} seconds or it will be killed with zero results.
-Given a wordlist's size (shown above as "N lines"), you need enough threads (-t) that the scan finishes in time.
-As a practical guide: wordlists over 10,000 lines need -t 80-150. Wordlists under 5,000 lines are fine with -t 40-60.
-If a wordlist is very large and you're unsure it'll finish in time, prefer a smaller wordlist instead of risking a timeout with zero results.
+Wordlists over 10,000 lines need -t 80-150. Under 5,000 lines, -t 40-60 is fine.
 
 ## Task
-Analyze the recon data and soft-404 probes above, then pick fuzzing parameters based on the flag descriptions in the ffuf help output.
+Analyze the recon data and soft-404 probes above, then pick fuzzing parameters.
 
-Filtering priority (important — read carefully):
-1. If the soft-404 probes show real 404 status codes for missing paths, prefer filtering by status code (e.g. -fc 404) over size — status codes are reliable and consistent, whereas response sizes can vary between different missing paths (e.g. a missing .php file vs a missing bare path may return different-sized 404 bodies even though both are real 404s).
-2. Only use size-based filtering (-fs) for path styles where the probe shows a SOFT-404 (status 200 for a nonexistent path) — in that case, status filtering won't work, so filter by the specific size shown for that probe.
-3. Do NOT combine "-mc all" with only a single -fs value as your sole filter — this lets all other status codes and sizes through unfiltered, producing noisy results. If you use -mc, specify the codes you actually want (e.g. "200,301,302"). If you need both status and size filtering because different path styles behave differently, use both -fc/-mc AND -fs together, not one alone.
+Filtering priority:
+1. Prefer status-code filtering (-fc) when probes show real 404s — reliable across path styles even if body sizes differ.
+2. Use size-based filtering (-fs) only where probes show a soft-404 (status 200 for a missing path).
+3. Never use "-mc all" as your only filter alongside a single -fs value — combine status and size filtering if the target needs both, or be specific with -mc codes.
 
-Choose a wordlist appropriate to your fuzz_mode. Prefer larger, more general wordlists (hundreds of lines or more) unless the target clearly calls for a small specialized list. Avoid near-empty wordlists (under ~30 lines) unless you have a specific reason.
+Choose a wordlist appropriate to your fuzz_mode. Prefer larger, general wordlists (hundreds+ lines) unless a small specialized list is clearly better. Avoid near-empty wordlists (under ~30 lines).
 
-Respond with ONLY a JSON object in EXACTLY this format (this is a FORMAT example only — every value below is a placeholder, not a real answer. Your actual values must come from YOUR analysis of the recon data and ffuf help text above, not from this example):
+Respond with ONLY a JSON object in EXACTLY this format (FORMAT example only — every value is a placeholder, not a real answer):
 
 {{
   "fuzz_mode": "<path or subdomain>",
   "flags": ["<flag1>", "<value1>", "<flag2>", "<value2>"],
-  "wordlist_filename": "<pick one exact filename from the list above, no size suffix>",
-  "reasoning": "<explain your specific choices using the actual recon numbers and probe results above, including why you picked this fuzz_mode, these filters, and this wordlist>"
+  "wordlist_filename": "<pick one exact filename from the list above>",
+  "reasoning": "<explain your specific choices using the actual recon numbers and probe results above>"
 }}
 
 Do not output a JSON schema. Do not include "type", "properties", or "required" keys.
-Do not copy the placeholder text above literally — every value must be your own decision based on the real recon data and flag help text provided."""
+Do not copy the placeholder text literally — every value must come from your own analysis."""
 
 FFUF_ARGS_SCHEMA = {
     "type": "object",
     "properties": {
-        "fuzz_mode": {
-            "type": "string",
-            "enum": ["path", "subdomain"]
-        },
-        "flags": {
-            "type": "array",
-            "items": {"type": "string"},
-            "description": "Flag/value pairs, e.g. ['-mc', '200,301', '-t', '40']"
-        },
-        "wordlist_filename": {
-            "type": "string"
-        },
-        "reasoning": {
-            "type": "string"
-        }
+        "fuzz_mode": {"type": "string", "enum": ["path", "subdomain"]},
+        "flags": {"type": "array", "items": {"type": "string"}},
+        "wordlist_filename": {"type": "string"},
+        "reasoning": {"type": "string"}
     },
     "required": ["fuzz_mode", "flags", "wordlist_filename", "reasoning"],
     "additionalProperties": False
 }
 
-def get_prompt(ffuf_help_text: str, wordlists: list, recon_data: dict, scan_timeout: int) -> str:
-    # pull out soft_404_probes separately since it needs pretty-printing, not raw dict repr
+
+RECURSE_SYSTEM_PROMPT = """You just completed a fuzzing scan and found some directories (paths that returned a 301 redirect to a trailing-slash version of themselves).
+
+## Discovered directories
+{directories}
+
+## Current recursion depth: {depth} (max allowed: {max_depth})
+## Max directories you may choose to recurse into: {max_targets}
+
+## Task
+Decide whether any of these directories are worth fuzzing further (to discover files/subdirectories inside them). Prioritize directories that look interesting for security discovery (e.g. admin panels, content management directories, config-adjacent names) over generic static-asset directories (e.g. images, css, fonts) unless you have a specific reason to explore them.
+
+Respond with ONLY a JSON object in EXACTLY this format (FORMAT example only, not real values):
+
+{{
+  "recurse": true,
+  "targets": ["<directory_url_1>", "<directory_url_2>"],
+  "reasoning": "<why these directories and not others, or why none are worth it>"
+}}
+
+If none are worth exploring further, return "recurse": false and an empty "targets" list.
+Do not select more than {max_targets} targets. Do not copy the placeholder literally."""
+
+RECURSE_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "recurse": {"type": "boolean"},
+        "targets": {"type": "array", "items": {"type": "string"}},
+        "reasoning": {"type": "string"}
+    },
+    "required": ["recurse", "targets", "reasoning"],
+    "additionalProperties": False
+}
+
+
+# in prompts.py
+def get_prompt(ffuf_help_text: str, wordlists: list, recon_data: dict, scan_timeout: int, methodology: str = "") -> str:
     probes = recon_data.get("soft_404_probes", {})
     probes_text = json.dumps(probes, indent=2)
-
-    # build a copy of recon_data without soft_404_probes so **recon_data doesn't double-supply it
     recon_fields = {k: v for k, v in recon_data.items() if k != "soft_404_probes"}
 
     return SYSTEM_PROMPT.format(
         ffuf_help_text=ffuf_help_text,
+        methodology=methodology,
         wordlist_filenames="\n".join(wordlists),
         soft_404_probes=probes_text,
         scan_timeout=scan_timeout,
         **recon_fields
+    )
+
+def get_recurse_prompt(directories: list, depth: int, max_depth: int, max_targets: int) -> str:
+    dirs_text = "\n".join(directories) if directories else "(none found)"
+    return RECURSE_SYSTEM_PROMPT.format(
+        directories=dirs_text,
+        depth=depth,
+        max_depth=max_depth,
+        max_targets=max_targets
     )

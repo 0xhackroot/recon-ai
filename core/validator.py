@@ -10,22 +10,22 @@ from analyzers.prompts import FFUF_ARGS_SCHEMA
 
 
 def get_ffuf_help_text() -> str:
-    """Raw ffuf -h output, given to the LLM directly so it can read flag descriptions itself."""
     result = subprocess.run(["ffuf", "-h"], capture_output=True, text=True)
     return result.stdout
 
 
 def get_valid_ffuf_flags() -> list:
-    """Flag names only, used for validation."""
     result = subprocess.run(["ffuf", "-h"], capture_output=True, text=True)
     flags = set(re.findall(r'(-{1,2}[a-zA-Z\-]+)', result.stdout))
     return list(flags)
 
 
-def parse_llm_response(raw_text: str) -> dict:
-    """Extracts the first complete JSON object from the LLM output."""
-    cleaned = raw_text.strip()
+def parse_llm_response(raw_text: str, schema: dict = None) -> dict:
+    """Extracts the first complete JSON object from the LLM output, validated against schema."""
+    if schema is None:
+        schema = FFUF_ARGS_SCHEMA
 
+    cleaned = raw_text.strip()
     start = cleaned.find('{')
     if start == -1:
         raise ValueError("LLM output invalid: no JSON object found")
@@ -48,7 +48,7 @@ def parse_llm_response(raw_text: str) -> dict:
 
     try:
         data = json.loads(json_str)
-        validate(instance=data, schema=FFUF_ARGS_SCHEMA)
+        validate(instance=data, schema=schema)
         return data
     except (json.JSONDecodeError, ValidationError) as e:
         raise ValueError(f"LLM output invalid: {e}")
@@ -79,10 +79,6 @@ def resolve_wordlist(llm_filename: str) -> str:
 
 
 def build_locked_url(target: str, fuzz_mode: str) -> str:
-    """
-    Builds the locked, safe URL for the given fuzz mode.
-    Code owns WHERE FUZZ can legally go — LLM only chose the mode.
-    """
     parsed = urlparse(target)
     scheme = parsed.scheme or "http"
     netloc = parsed.netloc or parsed.path
@@ -126,3 +122,32 @@ def build_safe_command(llm_flags: list, llm_wordlist: str, fuzz_mode: str, locke
     args += ["-w", wordlist_path]
 
     return ["ffuf"] + args, output_path
+
+
+def extract_directory_candidates(hits: list) -> list:
+    """
+    Finds paths worth considering for recursion:
+    - explicit 301 redirects to a trailing-slash version of themselves, OR
+    - 200 responses whose last path segment has no file extension
+      (heuristically directory-like, e.g. /portal, /admin)
+    """
+    candidates = []
+    for hit in hits:
+        status = hit.get("status")
+        redirect = hit.get("redirectlocation", "")
+        url = hit.get("url", "")
+
+        if status == 301 and redirect.endswith("/"):
+            candidates.append(redirect)
+        elif status == 200:
+            last_segment = url.rstrip("/").split("/")[-1]
+            if last_segment and "." not in last_segment:
+                candidates.append(url.rstrip("/") + "/")
+
+    seen = set()
+    unique = []
+    for c in candidates:
+        if c not in seen:
+            seen.add(c)
+            unique.append(c)
+    return unique
